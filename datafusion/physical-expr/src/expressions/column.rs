@@ -21,9 +21,11 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow::{
+    array::StructArray,
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
+use arrow_schema::Field;
 
 use crate::physical_expr::down_cast_any_ref;
 use crate::{AnalysisContext, PhysicalExpr};
@@ -34,7 +36,7 @@ use datafusion_expr::ColumnarValue;
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct Column {
     name: String,
-    index: usize,
+    index_path: Vec<usize>,
 }
 
 impl Column {
@@ -42,7 +44,15 @@ impl Column {
     pub fn new(name: &str, index: usize) -> Self {
         Self {
             name: name.to_owned(),
-            index,
+            index_path: vec![index],
+        }
+    }
+
+    /// Create a new column with a path pointing to a nested field (Struct or List)
+    pub fn new_with_path(name: &str, index_path: Vec<usize>) -> Self {
+        Column {
+            name: name.to_owned(),
+            index_path,
         }
     }
 
@@ -58,13 +68,22 @@ impl Column {
 
     /// Get the column index
     pub fn index(&self) -> usize {
-        self.index
+        self.index_path[0]
     }
 }
 
 impl std::fmt::Display for Column {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}@{}", self.name, self.index)
+        write!(
+            f,
+            "{}@{}",
+            self.name,
+            self.index_path
+                .iter()
+                .map(|index| index.to_string())
+                .collect::<Vec<String>>()
+                .join(".")
+        )
     }
 }
 
@@ -76,20 +95,37 @@ impl PhysicalExpr for Column {
 
     /// Get the data type of this expression, given the schema of the input
     fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
-        self.bounds_check(input_schema)?;
-        Ok(input_schema.field(self.index).data_type().clone())
+        Ok(self.field(input_schema)?.data_type().clone())
     }
 
     /// Decide whehter this expression is nullable, given the schema of the input
     fn nullable(&self, input_schema: &Schema) -> Result<bool> {
-        self.bounds_check(input_schema)?;
-        Ok(input_schema.field(self.index).is_nullable())
+        Ok(self.field(input_schema)?.is_nullable())
     }
 
     /// Evaluate the expression
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        self.bounds_check(batch.schema().as_ref())?;
-        Ok(ColumnarValue::Array(batch.column(self.index).clone()))
+        let mut index_iter = self.index_path.iter();
+        let mut array = batch
+            .column(
+                *index_iter
+                    .next()
+                    .ok_or(self.bounds_error(&batch.schema()))?,
+            )
+            .clone();
+        for index in index_iter {
+            array = match array.data_type() {
+                DataType::Struct(_) => array
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or(self.bounds_error(&batch.schema()))?
+                    .column(*index)
+                    .clone(),
+                _ => Err(self.bounds_error(&batch.schema()))?,
+            };
+        }
+
+        Ok(ColumnarValue::Array(array))
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
@@ -105,8 +141,8 @@ impl PhysicalExpr for Column {
 
     /// Return the boundaries of this column, if known.
     fn analyze(&self, context: AnalysisContext) -> AnalysisContext {
-        assert!(self.index < context.column_boundaries.len());
-        let col_bounds = context.column_boundaries[self.index].clone();
+        assert!(self.index_path[0] < context.column_boundaries.len());
+        let col_bounds = context.column_boundaries[self.index_path[0]].clone();
         context.with_boundaries(col_bounds)
     }
 }
@@ -121,15 +157,34 @@ impl PartialEq<dyn Any> for Column {
 }
 
 impl Column {
-    fn bounds_check(&self, input_schema: &Schema) -> Result<()> {
-        if self.index < input_schema.fields.len() {
-            Ok(())
-        } else {
-            Err(DataFusionError::Internal(format!(
-                "PhysicalExpr Column references column '{}' at index {} (zero-based) but input schema only has {} columns: {:?}",
-                self.name,
-                self.index, input_schema.fields.len(), input_schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<String>>())))
+    /// Get the field this expression refers to, given the schema of the input
+    fn field(&self, input_schema: &Schema) -> Result<Field> {
+        let mut index_iter = self.index_path.iter();
+        let mut field = input_schema
+            .field(*index_iter.next().ok_or(self.bounds_error(input_schema))?);
+        for index in index_iter {
+            field = match field.data_type() {
+                DataType::Struct(fields) => {
+                    fields.get(*index).ok_or(self.bounds_error(input_schema))?
+                }
+                _ => Err(self.bounds_error(input_schema))?,
+            };
         }
+
+        Ok(field.clone())
+    }
+
+    fn bounds_error(&self, input_schema: &Schema) -> DataFusionError {
+        DataFusionError::Execution(format!(
+            "PhysicalExpr Column references column '{}' at index path [{}] but it is out of bounds of the current schema {}",
+            self.name,
+            self.index_path
+                .iter()
+                .map(|index| index.to_string())
+                .collect::<Vec<String>>()
+                .join(", "),
+            input_schema
+        ))
     }
 }
 
